@@ -4,26 +4,24 @@ import json
 
 st.set_page_config(page_title="Cap Vault AI", page_icon="🧢", layout="wide")
 
-# تهيئة حافضة حفظ العملاء في الجلسة
+# إعداد مفتاح API المباشر
+API_KEY = st.secrets["GEMINI_API_KEY"]
+
+# تهيئة حافظة البيانات
 if "customers" not in st.session_state:
     st.session_state.customers = []
 
 st.title("🧢 Cap Vault AI")
 st.caption("نظام إدخال وتصنيف طلبات الكابات بالذكاء الاصطناعي")
 
-# القائمة الجانبية للمفتاح
-with st.sidebar:
-    st.header("⚙️ الإعدادات")
-    api_key = st.text_input("أدخل Gemini API Key هنا:", type="password")
-
 SYSTEM_PROMPT = """
 أنت مساعد آلي متخصص لبراند كابات (Caps Brand).
-قم بتحليل نص الطلب واستخراج البيانات منه بدقة وإرجاعها على شكل JSON بالصيغة التالية:
+قم بتحليل نص الطلب واستخراج البيانات منه بدقة وإرجاعها على شكل JSON بالصيغة التالية فقط دون أي نص إضافي:
 {
   "name": "اسم العميل",
   "phone": "رقم الموبايل",
   "address": "العنوان والمحافظة",
-  "category": "Classic أو Stock أو Fitted",
+  "category": "إحدى القيم: Classic أو Stock أو Fitted",
   "product_details": "اسم الكاب واللون والمقاس والتفاصيل",
   "subtotal": "سعر الكاب برقم فقط",
   "shipping": "مصاريف الشحن برقم فقط",
@@ -39,17 +37,14 @@ with tab1:
     order_text = st.text_area("انسخ نص الطلب هنا:", height=180, placeholder="Customer\nمندو Afro\n01034763979...")
     
     if st.button("✨ تحليل وإضافة الطلب"):
-        if not api_key:
-            st.error("⚠️ يرجى إدخال Gemini API Key في القائمة الجانبية أولاً!")
-        elif not order_text.strip():
+        if not order_text.strip():
             st.warning("⚠️ يرجى إدخال نص الطلب.")
         else:
             try:
-                # إعداد المكتبة واستخدام النموذج المعتمد gemini-2.5-flash
-                genai.configure(api_key=api_key)
+                # إعداد الموديل بالنسخة المعتمدة والمفتاح المدمج
+                genai.configure(api_key=API_KEY)
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 
-                # استخدام استجابة JSON المباشرة
                 response = model.generate_content(
                     f"{SYSTEM_PROMPT}\n\nنص الطلب:\n{order_text}",
                     generation_config={"response_mime_type": "application/json"}
@@ -96,7 +91,7 @@ with tab2:
                 st.write(f"🧢 **قسم الاهتمام:** `{c.get('category')}` | 📦 **المنتج:** {c.get('product_details')}")
                 st.write(f"🏷️ **كود الخصم:** {c.get('promo_used')} | 💰 **إجمالي الإنفاق:** {c.get('total_spent')} EGP")
                 
-                # رابط واتساب مباشر المراسلة
+                # رابط واتساب مباشر للمراسلة
                 phone_clean = str(c.get('phone', '')).replace(" ", "").replace("+", "")
                 if phone_clean.startswith("0"):
                     phone_clean = "2" + phone_clean
