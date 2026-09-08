@@ -2,57 +2,105 @@ import streamlit as st
 import google.generativeai as genai
 import json
 
-st.set_page_config(page_title="Cap Vault AI", page_icon="🧢")
+st.set_page_config(page_title="Cap Vault AI", page_icon="🧢", layout="wide")
 
-# حفظ البيانات مؤقتاً
+# تهيئة حافضة حفظ العملاء في الجلسة
 if "customers" not in st.session_state:
     st.session_state.customers = []
 
 st.title("🧢 Cap Vault AI")
+st.caption("نظام إدخال وتصنيف طلبات الكابات بالذكاء الاصطناعي")
 
-# المفتاح والقائمة الجانبية
+# القائمة الجانبية للمفتاح
 with st.sidebar:
-    api_key = st.text_input("Gemini API Key:", type="password")
+    st.header("⚙️ الإعدادات")
+    api_key = st.text_input("أدخل Gemini API Key هنا:", type="password")
 
 SYSTEM_PROMPT = """
-أنت مساعد لبراند كابات. استخرج البيانات من النص وأرجع JSON فقط:
+أنت مساعد آلي متخصص لبراند كابات (Caps Brand).
+قم بتحليل نص الطلب واستخراج البيانات منه بدقة وإرجاعها على شكل JSON بالصيغة التالية:
 {
   "name": "اسم العميل",
   "phone": "رقم الموبايل",
-  "address": "العنوان",
+  "address": "العنوان والمحافظة",
   "category": "Classic أو Stock أو Fitted",
-  "product_details": "تفاصيل المنتج",
-  "total": "الإجمالي برقم فقط",
-  "promo_used": "اسم الكود أو لا يوجد"
+  "product_details": "اسم الكاب واللون والمقاس والتفاصيل",
+  "subtotal": "سعر الكاب برقم فقط",
+  "shipping": "مصاريف الشحن برقم فقط",
+  "total": "الإجمالي النهائي برقم فقط",
+  "promo_used": "اسم كود الخصم أو 'لا يوجد'"
 }
 """
 
-tab1, tab2 = st.tabs(["💬 إضافة طلب", "📊 لوحة العملاء"])
+tab1, tab2 = st.tabs(["💬 إضافة طلب جديد", "📊 لوحة العملاء والمبيعات"])
 
+# --- TAB 1: تحليل وإضافة طلب ---
 with tab1:
-    order_text = st.text_area("انسخ نص الطلب هنا:", height=150)
-    if st.button("✨ تحليل وإضافة"):
+    order_text = st.text_area("انسخ نص الطلب هنا:", height=180, placeholder="Customer\nمندو Afro\n01034763979...")
+    
+    if st.button("✨ تحليل وإضافة الطلب"):
         if not api_key:
-            st.error("أدخل API Key في الجانب أولاً!")
-        elif order_text:
+            st.error("⚠️ يرجى إدخال Gemini API Key في القائمة الجانبية أولاً!")
+        elif not order_text.strip():
+            st.warning("⚠️ يرجى إدخال نص الطلب.")
+        else:
             try:
+                # إعداد المكتبة واستخدام النموذج المعتمد gemini-2.5-flash
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel('gemini-2.5-flash')
-                res = model.generate_content(f"{SYSTEM_PROMPT}\n\n{order_text}")
-                data = json.loads(res.text.replace("```json","").replace("```","").strip())
                 
-                st.session_state.customers.append(data)
-                st.success(f"تمت إضافة العميل: {data['name']} بنجاح!")
+                # استخدام استجابة JSON المباشرة
+                response = model.generate_content(
+                    f"{SYSTEM_PROMPT}\n\nنص الطلب:\n{order_text}",
+                    generation_config={"response_mime_type": "application/json"}
+                )
+                
+                data = json.loads(response.text)
+                
+                # التحقق إذا كان العميل موجوداً مسبقاً بناءً على رقم الموبايل
+                existing = next((c for c in st.session_state.customers if c.get('phone') == data.get('phone')), None)
+                
+                if existing:
+                    existing['orders_count'] = existing.get('orders_count', 1) + 1
+                    try:
+                        existing['total_spent'] += float(data.get('total', 0))
+                    except:
+                        pass
+                    existing['customer_type'] = "متكرر 🔵"
+                    existing['last_product'] = data.get('product_details')
+                    st.success(f"🎉 تم تحديث بيانات العميل المكرر: {data.get('name')} بنجاح!")
+                else:
+                    data['orders_count'] = 1
+                    try:
+                        data['total_spent'] = float(data.get('total', 0))
+                    except:
+                        data['total_spent'] = 0.0
+                    data['customer_type'] = "جديد 🟢"
+                    st.session_state.customers.append(data)
+                    st.success(f"🎉 تم إضافة العميل الجديد: {data.get('name')} بنجاح!")
+                    
             except Exception as e:
-                st.error(f"خطأ: {e}")
+                st.error(f"حدث خطأ أثناء معالجة الطلب: {e}")
 
+# --- TAB 2: عرض قاعدة البيانات ---
 with tab2:
-    for c in st.session_state.customers:
-        st.write(f"### 👤 {c.get('name')}")
-        st.write(f"📞 {c.get('phone')} | 📍 {c.get('address')}")
-        st.write(f"🧢 الفئة: **{c.get('category')}** | 📦 {c.get('product_details')}")
+    if not st.session_state.customers:
+        st.info("لا توجد طلبات مسجلة حتى الآن. انسخ طلبك الأول في التبويب الأول للبدء.")
+    else:
+        st.subheader("قائمة العملاء المضافين")
         
-        phone = str(c.get('phone')).replace(" ", "")
-        if phone.startswith("0"): phone = "2" + phone
-        st.markdown(f"[💬 مراسلة واتساب](https://wa.me/{phone})")
-        st.divider()
+        for c in st.session_state.customers:
+            with st.container():
+                st.write(f"### 👤 {c.get('name')} ({c.get('customer_type')})")
+                st.write(f"📞 **الموبايل:** {c.get('phone')} | 📍 **العنوان:** {c.get('address')}")
+                st.write(f"🧢 **قسم الاهتمام:** `{c.get('category')}` | 📦 **المنتج:** {c.get('product_details')}")
+                st.write(f"🏷️ **كود الخصم:** {c.get('promo_used')} | 💰 **إجمالي الإنفاق:** {c.get('total_spent')} EGP")
+                
+                # رابط واتساب مباشر المراسلة
+                phone_clean = str(c.get('phone', '')).replace(" ", "").replace("+", "")
+                if phone_clean.startswith("0"):
+                    phone_clean = "2" + phone_clean
+                    
+                wa_url = f"https://wa.me/{phone_clean}?text=أهلاً%20{c.get('name')}%20👋%20عندنا%20Drop%20جديد%20في%20قسم%20{c.get('category')}"
+                st.markdown(f"[💬 مراسلة العميل عبر WhatsApp Direct]({wa_url})")
+                st.divider()
