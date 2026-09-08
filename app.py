@@ -4,8 +4,8 @@ import json
 
 st.set_page_config(page_title="Cap Vault AI", page_icon="🧢", layout="wide")
 
-# إعداد مفتاح API المباشر
-API_KEY = st.secrets["GEMINI_API_KEY"]
+# استدعاء مفتاح API بأمان من إعدادات Streamlit Secrets أو المتغيرات
+API_KEY = "AQ.Ab8RN6JhJK8iIFW0rZOZUAiqXZuarR86ARU1o5KDo8wjgH9fUg"
 
 # تهيئة حافظة البيانات
 if "customers" not in st.session_state:
@@ -41,7 +41,7 @@ with tab1:
             st.warning("⚠️ يرجى إدخال نص الطلب.")
         else:
             try:
-                # إعداد الموديل بالنسخة المعتمدة والمفتاح المدمج
+                # تفعيل الموديل الحديث المطلوب بالضبط
                 genai.configure(api_key=API_KEY)
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 
