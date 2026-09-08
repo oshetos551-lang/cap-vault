@@ -1,14 +1,46 @@
-# Cap Vault AI — Brand Caps Order Manager
-# Streamlit + Google Gemini (gemini-2.5-flash) with JSON mode
+# Cap Vault AI v2 — Brand Caps Order Manager (Fixed)
+# Supports NEW google-genai SDK + OLD google-generativeai fallback
+# Primary model: gemini-3.6-flash with automatic fallback chain
 # Key loaded securely from st.secrets["GEMINI_API_KEY"]
 
 import streamlit as st
-import google.generativeai as genai
 import json
 import re
 import urllib.parse
 from datetime import datetime
+
 import pandas as pd
+
+# -------------------------------------------------
+# 0) SDK detection (new + old)
+# -------------------------------------------------
+HAS_NEW_SDK = False
+HAS_OLD_SDK = False
+NEW_SDK_ERROR = ""
+OLD_SDK_ERROR = ""
+
+try:
+    from google import genai as new_genai
+    from google.genai import types as new_types
+    HAS_NEW_SDK = True
+except Exception as e:
+    NEW_SDK_ERROR = str(e)
+
+try:
+    import google.generativeai as old_genai
+    HAS_OLD_SDK = True
+except Exception as e:
+    OLD_SDK_ERROR = str(e)
+
+# Model fallback chain — first working model wins.
+# gemini-3.6-flash is the stable 2026 workhorse (July 2026 release).
+MODEL_CANDIDATES = [
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-2.5-flash",  # legacy: may 404 for new users, kept as last resort
+]
 
 # -------------------------------------------------
 # 1) Page Config (Mobile First)
@@ -21,17 +53,12 @@ st.set_page_config(
 )
 
 # -------------------------------------------------
-# 2) Custom CSS — Modern E-commerce Style (Chosen)
+# 2) Custom CSS — Modern E-commerce Style
 # -------------------------------------------------
-# Why this style? Best for mobile + Arabic + store vibe:
-# - Big touch buttons, rounded cards, gradient header
-# - RTL friendly, Cairo font feel, high contrast
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
-
 * { font-family: 'Cairo', sans-serif !important; }
-
 .stApp {
     background: #0f1115;
     background-image: radial-gradient(circle at 20% 0%, #232a3a 0%, #0f1115 55%);
@@ -43,8 +70,6 @@ st.markdown("""
     direction: rtl;
     text-align: right;
 }
-
-/* Header hero */
 .hero {
     background: linear-gradient(135deg, #f5c518 0%, #ff8a00 50%, #e52e71 100%);
     border-radius: 20px;
@@ -56,8 +81,6 @@ st.markdown("""
 }
 .hero h1 { margin: 0; font-size: 28px; font-weight: 800; }
 .hero p { margin: 6px 0 0 0; font-size: 15px; font-weight: 600; opacity: .85; }
-
-/* Cards */
 .cap-card {
     background: #171b26;
     border: 1px solid #2a3145;
@@ -69,7 +92,6 @@ st.markdown("""
 }
 .cap-card.new { border-right: 6px solid #22c55e; }
 .cap-card.repeat { border-right: 6px solid #3b82f6; }
-.cap-card h3 { margin: 0 0 8px 0; font-size: 18px; }
 .badge {
     display: inline-block;
     padding: 3px 12px;
@@ -78,21 +100,19 @@ st.markdown("""
     font-weight: 700;
     margin-bottom: 8px;
 }
-.badge-new { background: #22c55e22; color: #4ade80; border: 1px solid #22c55e55; }
-.badge-repeat { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f655; }
+.badge-new { background: rgba(34,197,94,.13); color: #4ade80; border: 1px solid rgba(34,197,94,.35); }
+.badge-repeat { background: rgba(59,130,246,.13); color: #60a5fa; border: 1px solid rgba(59,130,246,.35); }
 .info-row { font-size: 14px; margin: 3px 0; color: #cbd5e1; }
 .info-row b { color: #fff; }
 .price-box {
     background: #0f1115;
-    border: 1px dashed #f5c51866;
+    border: 1px dashed rgba(245,197,24,.4);
     border-radius: 12px;
     padding: 10px 12px;
     margin-top: 10px;
     font-size: 14px;
 }
 .total-line { color: #f5c518; font-weight: 800; font-size: 16px; }
-
-/* Inputs */
 .stTextArea textarea, .stTextInput input {
     background: #0f1522 !important;
     color: #fff !important;
@@ -101,8 +121,6 @@ st.markdown("""
     text-align: right;
     direction: rtl;
 }
-
-/* Buttons */
 .stButton > button {
     width: 100%;
     border-radius: 14px !important;
@@ -115,8 +133,6 @@ st.markdown("""
     box-shadow: 0 6px 18px rgba(255,138,0,.35);
 }
 .stButton > button:hover { filter: brightness(1.05); transform: translateY(-1px); }
-
-/* WhatsApp button via link_button */
 .stLinkButton > a {
     width: 100%;
     border-radius: 14px !important;
@@ -128,8 +144,6 @@ st.markdown("""
     border: none !important;
     display: inline-block;
 }
-
-/* Metrics */
 div[data-testid="stMetric"] {
     background: #171b26;
     border: 1px solid #2a3145;
@@ -138,8 +152,6 @@ div[data-testid="stMetric"] {
     text-align: center;
 }
 div[data-testid="stMetricValue"] { color: #f5c518; }
-
-/* Mobile tweaks */
 @media (max-width: 640px) {
     .hero h1 { font-size: 22px; }
     .hero p { font-size: 13px; }
@@ -154,130 +166,266 @@ div[data-testid="stMetricValue"] { color: #f5c518; }
 def get_api_key():
     try:
         key = st.secrets["GEMINI_API_KEY"]
-        if not key or len(str(key).strip()) < 10:
-            return None
-        return str(key).strip().strip('"').strip("'")
     except Exception:
         return None
+    if key is None:
+        return None
+    key = str(key).strip().strip('"').strip("'").strip()
+    if len(key) < 10:
+        return None
+    return key
 
 API_KEY = get_api_key()
 
 # -------------------------------------------------
-# 4) Helpers
+# 4) Helpers (all bugs fixed)
 # -------------------------------------------------
-def clean_egypt_phone(raw: str) -> str:
-    """Normalize Egyptian phone to 01xxxxxxxxx."""
-    if not raw:
+def clean_egypt_phone(raw):
+    """Normalize Egyptian phone to 01xxxxxxxxx. Returns '' if invalid."""
+    if raw is None:
         return ""
     digits = re.sub(r"\D", "", str(raw))
-    # handle 0020 / +20 / 20 prefix
+    if not digits:
+        return ""
     if digits.startswith("0020"):
         digits = "0" + digits[4:]
     elif digits.startswith("20") and len(digits) == 12:
         digits = "0" + digits[2:]
-    # handle 1xxxxxxxxx (10 digits starting with 1)
     if len(digits) == 10 and digits.startswith("1"):
         digits = "0" + digits
-    return digits
+    # Valid Egyptian mobile: 11 digits starting with 010/011/012/015
+    if len(digits) == 11 and digits.startswith("01"):
+        return digits
+    # Return as-is if it looks like a phone, else ''
+    if 10 <= len(digits) <= 13:
+        return digits
+    return ""
 
-def to_whatsapp_number(phone_01: str) -> str:
-    """Convert 01xxxxxxxxx -> 201xxxxxxxxx for wa.me link."""
+def to_whatsapp_number(phone_01):
+    """Convert 01xxxxxxxxx -> 201xxxxxxxxx for wa.me link. '' if invalid."""
     p = clean_egypt_phone(phone_01)
+    if not p:
+        return ""
     if p.startswith("0") and len(p) == 11:
-        return "2" + p  # 20 + 1xxxxxxxxx
+        return "2" + p
     digits = re.sub(r"\D", "", p)
     if digits.startswith("20"):
         return digits
+    if digits.startswith("0"):
+        return "2" + digits
     return digits
 
-def safe_float(x, default=0.0) -> float:
+def safe_float(x, default=0.0):
     try:
-        if x is None or x == "":
-            return default
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return float(default)
         if isinstance(x, (int, float)):
             return float(x)
-        s = str(x).replace("جنيه", "").replace("ج.م", "").replace("EGP", "").replace(",", "").strip()
+        s = str(x).replace("جنيه", "").replace("ج.م", "").replace("EGP", "").replace("LE", "").replace(",", "").strip()
         m = re.search(r"(\d+(\.\d+)?)", s)
         if m:
             return float(m.group(1))
-        return default
+        return float(default)
     except Exception:
-        return default
+        return float(default)
 
-def build_whatsapp_message(data: dict, is_repeat: bool) -> str:
+def parse_json_safely(text):
+    """Extract JSON dict from model output, tolerating fences and extra text."""
+    if text is None:
+        raise ValueError("Empty response from model (None).")
+    t = str(text).strip()
+    if not t:
+        raise ValueError("Empty response from model.")
+    # Remove markdown fences
+    t = re.sub(r"^```(json)?\s*", "", t).strip()
+    t = re.sub(r"\s*```$", "", t).strip()
+    # Direct try
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Extract first {...} block
+    m = re.search(r"\{.*\}", t, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    # Extract array-wrapped? take first element
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            return obj[0]
+    except Exception:
+        pass
+    raise ValueError("Model did not return valid JSON. Raw: " + t[:300])
+
+def normalize_section(section_raw, product_details=""):
+    s = str(section_raw or "").strip().lower()
+    mapping = {
+        "classic": "Classic",
+        "كلاسيك": "Classic",
+        "stock": "Stock",
+        "ستوك": "Stock",
+        "fitted": "Fitted",
+        "فيتد": "Fitted",
+        "فitted": "Fitted",
+    }
+    if s in mapping:
+        return mapping[s]
+    pd = str(product_details or "").lower()
+    pd_ar = str(product_details or "")
+    if "fitted" in pd or "فيتد" in pd_ar or "سناب" in pd_ar:
+        return "Fitted"
+    if "stock" in pd or "ستوك" in pd_ar:
+        return "Stock"
+    return "Classic"
+
+def build_whatsapp_message(data, is_repeat):
     name = data.get("customer_name") or "عميلنا العزيز"
     product = data.get("product_details") or "الأوردر الخاص بك"
     section = data.get("section") or ""
     total = data.get("total", 0)
+    try:
+        total_str = f"{float(total):,.0f}"
+    except Exception:
+        total_str = str(total)
     address = data.get("address") or ""
-    greeting = f"أهلاً {name} 🌟 منورنا مرة تانية في Cap Vault" if is_repeat else f"أهلاً {name} 🌟 شكراً لطلبك من Cap Vault"
-    msg = (
-        f"{greeting} 🧢\n\n"
-        f"تأكيد الأوردر:\n"
-        f"🧢 المنتج: {product}\n"
-        f"📦 القسم: {section}\n"
-        f"📍 العنوان: {address}\n"
-        f"💰 الإجمالي: {total} جنيه\n\n"
-        f"هنأكد معاك الشحن قريباً 🚚\n"
-        f"Cap Vault — شكراً لثقتك ❤️"
-    )
-    return msg
+    if is_repeat:
+        greeting = "أهلاً " + str(name) + " 🌟 منورنا مرة تانية في Cap Vault"
+    else:
+        greeting = "أهلاً " + str(name) + " 🌟 شكراً لطلبك من Cap Vault"
+    lines = [
+        greeting + " 🧢",
+        "",
+        "تأكيد الأوردر:",
+        "🧢 المنتج: " + str(product),
+        "📦 القسم: " + str(section),
+        "💰 الإجمالي: " + total_str + " جنيه",
+        "📍 العنوان: " + str(address),
+        "",
+        "هنأكد معاك الشحن قريباً 🚚",
+        "Cap Vault — شكراً لثقتك ❤️",
+    ]
+    return "\n".join(lines)
 
-SYSTEM_PROMPT = """أنت مساعد استخراج بيانات لأوردرات براند كابات مصري اسمه Cap Vault.
-مهمتك: استخراج بيانات العميل من أي نص أوردر بالعربي (مصري/فصحى) أو فرانكو أو إنجليزي.
+# -------------------------------------------------
+# 5) Gemini extraction (new SDK + old SDK + fallback)
+# -------------------------------------------------
+SYSTEM_PROMPT = """You are a data extraction assistant for an Egyptian caps brand called Cap Vault.
+Task: extract order data from any message (Egyptian Arabic, MSA, Franco-Arabic, or English — including online store order summaries).
 
-أرجع JSON فقط بهذه المفاتيح بالضبط (بدون أي شرح إضافي):
+Return ONLY JSON with exactly these keys (no explanation):
 {
-  "customer_name": string أو null,
-  "mobile": string أو null (رقم الموبايل المصري),
-  "address": string أو null (العنوان كامل: محافظة - منطقة - شارع - علامة مميزة),
-  "section": string أو null (واحد فقط من: Classic, Stock, Fitted — خمن الأقرب من وصف المنتج، ولو مش واضح ضع Classic),
-  "product_details": string أو null (اسم الكاب + اللون + المقاس + الكمية بالتفصيل),
-  "price": number أو null (سعر المنتج بدون شحن),
-  "shipping": number أو null (سعر الشحن، لو مش مذكور ضع 0),
-  "total": number أو null (الإجمالي = السعر + الشحن، احسبه لو ناقص),
-  "discount_code": string أو null (كود الخصم لو موجود وإلا null)
+  "customer_name": string or null,
+  "mobile": string or null (Egyptian mobile number),
+  "address": string or null (full address: governorate - area - street - landmark),
+  "section": string or null (exactly one of: Classic, Stock, Fitted — guess closest from product, default Classic),
+  "product_details": string or null (cap name + color + size + quantity in detail),
+  "price": number or null (product subtotal without shipping),
+  "shipping": number or null (shipping cost, 0 if not mentioned),
+  "total": number or null (grand total = price + shipping, compute if missing),
+  "discount_code": string or null (discount code if present else null)
 }
 
-قواعد:
-- الأرقام تكون أرقام فقط بدون عملة.
-- لو السعر مكتوب "350 جنيه" أرجعه 350.
-- لو العميل كاتب "عايز 2 كلاسيك اسود" افهم أن الكمية 2 والقسم Classic.
-- الفرانكو زي "ana 3ayez cap black" افهمه عربي.
-- لا تخترع عنواناً أو رقماً غير موجود في النص، ضع null لو مش موجود.
+Rules:
+- Numbers must be plain numbers without currency. "500 EGP" -> 500.
+- Store format like "Cap Name (red) x 1 EGP 500.00, Subtotal 500, Shipping 180, Total 680" -> price 500, shipping 180, total 680, product_details from the cap name line.
+- "عايز 2 كلاسيك اسود" means quantity 2, section Classic.
+- Understand Franco like "ana 3ayez cap black".
+- Never invent a name, phone or address not present in the text — use null.
 """
 
-def extract_with_gemini(order_text: str, api_key: str) -> dict:
-    """Call gemini-2.5-flash with JSON mime type."""
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
+def _call_new_sdk(order_text, api_key, model_name):
+    client = new_genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model=model_name,
+        contents="Order text:\n" + order_text,
+        config=new_types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+    text = getattr(resp, "text", None)
+    if not text:
+        try:
+            parts = resp.candidates[0].content.parts
+            text = "".join([getattr(p, "text", "") or "" for p in parts])
+        except Exception:
+            text = ""
+    return text
+
+def _call_old_sdk(order_text, api_key, model_name):
+    old_genai.configure(api_key=api_key)
+    model = old_genai.GenerativeModel(
+        model_name=model_name,
         system_instruction=SYSTEM_PROMPT,
         generation_config={
             "response_mime_type": "application/json",
             "temperature": 0.1,
         },
     )
-    resp = model.generate_content(f"نص الأوردر:\n{order_text}")
-    text = (resp.text or "").strip()
-    # تنظيف أي Markdown code fences لو ظهرت
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    data = json.loads(text)
-    return data
+    resp = model.generate_content("Order text:\n" + order_text)
+    return getattr(resp, "text", "") or ""
+
+def extract_order(order_text, api_key):
+    """Try each candidate model with new SDK then old SDK. Returns (data, used_model)."""
+    errors = []
+    if not HAS_NEW_SDK and not HAS_OLD_SDK:
+        raise RuntimeError(
+            "No Gemini SDK installed. New SDK error: %s | Old SDK error: %s"
+            % (NEW_SDK_ERROR, OLD_SDK_ERROR)
+        )
+    for model_name in MODEL_CANDIDATES:
+        if HAS_NEW_SDK:
+            try:
+                raw = _call_new_sdk(order_text, api_key, model_name)
+                data = parse_json_safely(raw)
+                return data, model_name + " (new SDK)"
+            except Exception as e:
+                errors.append(model_name + " [new]: " + str(e)[:200])
+                et = str(e).lower()
+                if "api key" in et or "api_key" in et or "permission" in et or "unauthenticated" in et:
+                    break
+                if "quota" in et or "429" in et or "resource_exhausted" in et:
+                    break
+        if HAS_OLD_SDK:
+            try:
+                raw = _call_old_sdk(order_text, api_key, model_name)
+                data = parse_json_safely(raw)
+                return data, model_name + " (old SDK)"
+            except Exception as e:
+                errors.append(model_name + " [old]: " + str(e)[:200])
+                et = str(e).lower()
+                if "api key" in et or "api_key" in et or "permission" in et or "unauthenticated" in et:
+                    break
+                if "quota" in et or "429" in et or "resource_exhausted" in et:
+                    break
+                continue
+    detail = " | ".join(errors[:6]) if errors else "unknown error"
+    raise RuntimeError("All models failed. Details: " + detail)
 
 # -------------------------------------------------
-# 5) Session State (Customers DB)
+# 6) Session State (Customers DB)
 # -------------------------------------------------
 if "customers" not in st.session_state:
-    st.session_state.customers = {}  # phone -> record
+    st.session_state.customers = {}
 if "last_extract" not in st.session_state:
     st.session_state.last_extract = None
+if "last_model" not in st.session_state:
+    st.session_state.last_model = ""
 if "history" not in st.session_state:
-    st.session_state.history = []  # list of all orders
+    st.session_state.history = []
+if "order_text_input" not in st.session_state:
+    st.session_state.order_text_input = ""
 
 # -------------------------------------------------
-# 6) Header
+# 7) Header
 # -------------------------------------------------
 st.markdown("""
 <div class="hero">
@@ -286,20 +434,35 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# API key status
 if not API_KEY:
     st.error("⚠️ مفتاح GEMINI_API_KEY غير موجود في Secrets. ادخل على Settings → Secrets في Streamlit Cloud وأضفه.")
     st.code('GEMINI_API_KEY = "YOUR_KEY_HERE"', language="toml")
-    st.info("💡 هتلاقي الخطوات الكاملة تحت في قسم التشغيل.")
 else:
-    st.success("✅ الاتصال بـ Gemini جاهز (gemini-2.5-flash)")
+    sdk_info = []
+    if HAS_NEW_SDK:
+        sdk_info.append("google-genai ✅")
+    if HAS_OLD_SDK:
+        sdk_info.append("generativeai ✅")
+    st.success("✅ الاتصال بـ Gemini جاهز (%s) — الموديل الأساسي: %s" % (" + ".join(sdk_info) if sdk_info else "لا يوجد SDK!", MODEL_CANDIDATES[0]))
 
-# Metrics row
+# Metrics row (crash-safe)
+def _total_spent_of(rec):
+    try:
+        return float(rec.get("total_spent", 0) or 0)
+    except Exception:
+        return 0.0
+
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 total_customers = len(st.session_state.customers)
 total_orders = len(st.session_state.history)
-total_revenue = sum(float(v.get("total_spent", 0) or 0) for v in st.session_state.customers.values())
-repeat_count = sum(1 for v in st.session_state.customers.values() if v.get("order_count", 0) > 1)
+try:
+    total_revenue = sum(_total_spent_of(v) for v in st.session_state.customers.values())
+except Exception:
+    total_revenue = 0.0
+try:
+    repeat_count = sum(1 for v in st.session_state.customers.values() if int(v.get("order_count", 0) or 0) > 1)
+except Exception:
+    repeat_count = 0
 
 with col_m1:
     st.metric("👥 العملاء", total_customers)
@@ -313,27 +476,28 @@ with col_m4:
 st.divider()
 
 # -------------------------------------------------
-# 7) Order Input
+# 8) Order Input
 # -------------------------------------------------
 st.subheader("📝 أضف أوردر جديد")
 
-example_text = "السلام عليكم، انا احمد محمد، رقمى 01012345678، العنوان: القاهرة - مدينة نصر - شارع عباس العقاد عمارة 5 الدور الثالث، عايز كاب Classic اسود مقاس L عدد 2، السعر 700 والشحن 50، ومعايا كود خصم CAP10"
+EXAMPLE_TEXT = "السلام عليكم، انا احمد محمد، رقمى 01012345678، العنوان: القاهرة - مدينة نصر - شارع عباس العقاد عمارة 5 الدور الثالث، عايز كاب Classic اسود مقاس L عدد 2، السعر 700 والشحن 50، ومعايا كود خصم CAP10"
 
 order_text = st.text_area(
-    "الصق رسالة العميل هنا (واتساب / فيسبوك / انستجرام):",
+    "الصق رسالة العميل هنا (واتساب / فيسبوك / انستجرام / ملخص أوردر المتجر):",
     height=140,
-    placeholder=example_text,
+    placeholder=EXAMPLE_TEXT,
+    key="order_text_input",
 )
 
 col_a, col_b = st.columns([3, 1])
 with col_a:
     btn_extract = st.button("🤖 استخراج البيانات بالذكاء الاصطناعي", use_container_width=True)
 with col_b:
-    btn_sample = st.button("📋 جرّب مثال", use_container_width=False)
+    btn_sample = st.button("📋 جرّب مثال")
 
 if btn_sample:
-    st.session_state["_sample"] = example_text
-    st.info("✅ انسخ المثال ده والصقه فوق:\n\n" + example_text)
+    st.session_state.order_text_input = EXAMPLE_TEXT
+    st.rerun()
 
 if btn_extract:
     if not API_KEY:
@@ -341,11 +505,11 @@ if btn_extract:
     elif not order_text or len(order_text.strip()) < 5:
         st.warning("⚠️ الصق رسالة العميل الأول.")
     else:
-        with st.spinner("🤖 جاري استخراج البيانات بـ Gemini 2.5 Flash..."):
+        with st.spinner("🤖 جاري استخراج البيانات بـ Gemini..."):
             try:
-                data = extract_with_gemini(order_text.strip(), API_KEY)
+                data, used_model = extract_order(order_text.strip(), API_KEY)
+                st.session_state.last_model = used_model
 
-                # Normalize numbers
                 data["price"] = safe_float(data.get("price"), 0)
                 data["shipping"] = safe_float(data.get("shipping"), 0)
                 t = safe_float(data.get("total"), 0)
@@ -353,31 +517,26 @@ if btn_extract:
                     t = data["price"] + data["shipping"]
                 data["total"] = t
                 data["mobile"] = clean_egypt_phone(data.get("mobile") or "")
-                # Normalize section
-                sec = str(data.get("section") or "Classic").strip().capitalize()
-                if sec not in ["Classic", "Stock", "Fitted"]:
-                    # محاولة تخمين ذكية
-                    pd_low = str(data.get("product_details") or "").lower()
-                    if "fitted" in pd_low or "فيتد" in str(data.get("product_details") or ""):
-                        sec = "Fitted"
-                    elif "stock" in pd_low or "ستوك" in str(data.get("product_details") or ""):
-                        sec = "Stock"
-                    else:
-                        sec = "Classic"
-                data["section"] = sec
+                data["section"] = normalize_section(data.get("section"), data.get("product_details"))
 
                 st.session_state.last_extract = data
+                st.caption(f"⚙️ تم الاستخراج باستخدام: {used_model}")
 
-                # ---- Repeat-customer logic ----
+                if not data.get("mobile") and not data.get("customer_name") and not data.get("address"):
+                    st.warning("⚠️ النص ده شكله ملخص أوردر من المتجر بدون بيانات العميل (اسم/موبايل/عنوان). النتيجة تحت فيها المنتج والسعر فقط — الصق رسالة العميل الكاملة اللي فيها بياناته عشان يتحفظ كعميل.")
+
                 phone = data.get("mobile") or ""
                 if phone:
                     if phone in st.session_state.customers:
                         rec = st.session_state.customers[phone]
-                        rec["order_count"] = rec.get("order_count", 1) + 1
-                        rec["total_spent"] = float(rec.get("total_spent", 0)) + float(data["total"])
+                        try:
+                            prev_count = int(rec.get("order_count", 1) or 1)
+                        except Exception:
+                            prev_count = 1
+                        rec["order_count"] = prev_count + 1
+                        rec["total_spent"] = _total_spent_of(rec) + float(data["total"] or 0)
                         rec["last_order"] = data
                         rec["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        # update name/address if new values exist
                         if data.get("customer_name"):
                             rec["customer_name"] = data["customer_name"]
                         if data.get("address"):
@@ -390,7 +549,7 @@ if btn_extract:
                             "mobile": phone,
                             "address": data.get("address") or "",
                             "order_count": 1,
-                            "total_spent": float(data["total"]),
+                            "total_spent": float(data["total"] or 0),
                             "status": "جديد 🟢",
                             "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "last_seen": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -399,33 +558,49 @@ if btn_extract:
                         is_repeat = False
                     st.session_state.history.append({
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "phone": phone,
-                        **data,
+                        "mobile": phone,
+                        "customer_name": data.get("customer_name"),
+                        "address": data.get("address"),
+                        "section": data.get("section"),
+                        "product_details": data.get("product_details"),
+                        "price": data.get("price"),
+                        "shipping": data.get("shipping"),
+                        "total": data.get("total"),
+                        "discount_code": data.get("discount_code"),
                     })
                     if is_repeat:
-                        st.info(f"🔵 عميل متكرر! {rec['customer_name']} — عدد الطلبات: {rec['order_count']} — إجمالي الإنفاق: {rec['total_spent']:,.0f} جنيه")
+                        rec = st.session_state.customers[phone]
+                        st.info("🔵 عميل متكرر! %s — عدد الطلبات: %s — إجمالي الإنفاق: %,.0f جنيه" % (rec.get("customer_name"), rec.get("order_count"), _total_spent_of(rec)))
                     else:
-                        st.success(f"🟢 عميل جديد اتسجل: {data.get('customer_name') or phone}")
+                        st.success("🟢 عميل جديد اتسجل: %s" % (data.get("customer_name") or phone))
                 else:
-                    st.warning("⚠️ لم يتم العثور على رقم موبايل في الرسالة — البيانات مستخرجة لكن لم تُحفظ كعميل.")
+                    st.warning("⚠️ لم يتم العثور على رقم موبايل في الرسالة — البيانات مستخرجة تحت لكن لم تُحفظ كعميل.")
 
-            except json.JSONDecodeError:
-                st.error("❌ رد Gemini لم يكن JSON صالحاً. حاول مرة أخرى.")
             except Exception as e:
                 err = str(e)
-                if "API_KEY" in err or "API key" in err:
-                    st.error("❌ مشكلة في مفتاح API. تأكد من GEMINI_API_KEY في Secrets.")
-                elif "quota" in err.lower() or "429" in err:
+                el = err.lower()
+                if "api key" in el or "api_key" in el or "permission" in el or "unauthenticated" in el:
+                    st.error("❌ مشكلة في مفتاح API. تأكد من GEMINI_API_KEY في Secrets (Settings → Secrets) وأنه مفتاح جديد ساري.")
+                elif "quota" in el or "429" in el or "resource_exhausted" in el:
                     st.error("❌ تجاوزت حد الاستخدام المجاني. انتظر قليلاً وحاول مجدداً.")
+                elif "no longer available" in el or "404" in el or "not found" in el:
+                    st.error("❌ كل الموديلات المتاحة فشلت (404). حدّث requirements.txt ثم اعمل Reboot للتطبيق من Manage app.")
                 else:
-                    st.error(f"❌ خطأ: {err}")
+                    st.error("❌ خطأ: " + err)
+                with st.expander("🔧 تفاصيل تقنية للتشخيص"):
+                    st.code(err)
+                    st.write("SDK الجديد (google-genai):", "موجود ✅" if HAS_NEW_SDK else "غير موجود ❌ — " + NEW_SDK_ERROR[:200])
+                    st.write("SDK القديم (generativeai):", "موجود ✅" if HAS_OLD_SDK else "غير موجود ❌ — " + OLD_SDK_ERROR[:200])
+                    st.write("الموديلات المجرّبة:", ", ".join(MODEL_CANDIDATES))
 
 # -------------------------------------------------
-# 8) Last extraction preview
+# 9) Last extraction preview
 # -------------------------------------------------
 if st.session_state.last_extract:
     d = st.session_state.last_extract
     st.subheader("✨ آخر بيانات مستخرجة")
+    if st.session_state.last_model:
+        st.caption(f"⚙️ الموديل المستخدم: {st.session_state.last_model}")
     c1, c2 = st.columns(2)
     with c1:
         st.write(f"👤 **الاسم:** {d.get('customer_name') or '—'}")
@@ -434,9 +609,9 @@ if st.session_state.last_extract:
         st.write(f"📦 **القسم:** {d.get('section') or '—'}")
     with c2:
         st.write(f"🧢 **المنتج:** {d.get('product_details') or '—'}")
-        st.write(f"💵 **السعر:** {d.get('price', 0):,.0f} جنيه")
-        st.write(f"🚚 **الشحن:** {d.get('shipping', 0):,.0f} جنيه")
-        st.write(f"💰 **الإجمالي:** {d.get('total', 0):,.0f} جنيه")
+        st.write(f"💵 **السعر:** {safe_float(d.get('price')):,.0f} جنيه")
+        st.write(f"🚚 **الشحن:** {safe_float(d.get('shipping')):,.0f} جنيه")
+        st.write(f"💰 **الإجمالي:** {safe_float(d.get('total')):,.0f} جنيه")
         st.write(f"🎟️ **كود الخصم:** {d.get('discount_code') or '—'}")
 
     with st.expander("🧾 عرض JSON الخام"):
@@ -445,7 +620,7 @@ if st.session_state.last_extract:
 st.divider()
 
 # -------------------------------------------------
-# 9) Dashboard — Customer Cards + WhatsApp
+# 10) Dashboard — Customer Cards + WhatsApp
 # -------------------------------------------------
 st.subheader("📊 لوحة العملاء")
 
@@ -455,71 +630,106 @@ else:
     search = st.text_input("🔍 بحث بالاسم أو رقم الموبايل:", placeholder="مثال: احمد أو 010...")
     section_filter = st.selectbox("📦 فلترة حسب القسم:", ["الكل", "Classic", "Stock", "Fitted"])
 
-    phones = sorted(
-        st.session_state.customers.keys(),
-        key=lambda p: st.session_state.customers[p].get("total_spent", 0),
-        reverse=True,
-    )
+    def _sort_key(p):
+        try:
+            return float(st.session_state.customers[p].get("total_spent", 0) or 0)
+        except Exception:
+            return 0.0
+
+    phones = sorted(st.session_state.customers.keys(), key=_sort_key, reverse=True)
     if search:
         s = search.strip()
         phones = [p for p in phones if s in p or s in str(st.session_state.customers[p].get("customer_name", ""))]
     if section_filter != "الكل":
-        phones = [p for p in phones if st.session_state.customers[p].get("last_order", {}).get("section") == section_filter]
+        phones = [p for p in phones if (st.session_state.customers[p].get("last_order", {}) or {}).get("section") == section_filter]
 
     st.caption(f"عرض {len(phones)} عميل")
 
-    for phone in phones:
+    for idx, phone in enumerate(phones):
         rec = st.session_state.customers[phone]
-        last = rec.get("last_order", {})
-        is_repeat = rec.get("order_count", 1) > 1
+        last = rec.get("last_order", {}) or {}
+        try:
+            order_count = int(rec.get("order_count", 1) or 1)
+        except Exception:
+            order_count = 1
+        is_repeat = order_count > 1
         card_class = "repeat" if is_repeat else "new"
         badge_class = "badge-repeat" if is_repeat else "badge-new"
 
-        st.markdown(f"""
-        <div class="cap-card {card_class}">
-            <span class="badge {badge_class}">{rec.get('status')}</span>
-            <h3>👤 {rec.get('customer_name', 'بدون اسم')} — {phone}</h3>
-            <div class="info-row">📍 <b>العنوان:</b> {rec.get('address') or last.get('address') or '—'}</div>
-            <div class="info-row">🧢 <b>آخر منتج:</b> {last.get('product_details') or '—'}</div>
-            <div class="info-row">📦 <b>القسم:</b> {last.get('section') or '—'} &nbsp; | &nbsp; 🎟️ <b>خصم:</b> {last.get('discount_code') or '—'}</div>
-            <div class="info-row">🧾 <b>عدد الطلبات:</b> {rec.get('order_count', 1)} &nbsp; | &nbsp; 💰 <b>إجمالي الإنفاق:</b> {float(rec.get('total_spent', 0)):,.0f} جنيه</div>
+        st.markdown(
+            """
+        <div class="cap-card %s">
+            <span class="badge %s">%s</span>
+            <h3>👤 %s — %s</h3>
+            <div class="info-row">📍 <b>العنوان:</b> %s</div>
+            <div class="info-row">🧢 <b>آخر منتج:</b> %s</div>
+            <div class="info-row">📦 <b>القسم:</b> %s &nbsp; | &nbsp; 🎟️ <b>خصم:</b> %s</div>
+            <div class="info-row">🧾 <b>عدد الطلبات:</b> %s &nbsp; | &nbsp; 💰 <b>إجمالي الإنفاق:</b> %s جنيه</div>
             <div class="price-box">
-                💵 السعر: {safe_float(last.get('price')):,.0f} + 🚚 الشحن: {safe_float(last.get('shipping')):,.0f}
-                <br><span class="total-line">الإجمالي: {safe_float(last.get('total')):,.0f} جنيه</span>
+                💵 السعر: %s + 🚚 الشحن: %s
+                <br><span class="total-line">الإجمالي: %s جنيه</span>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """ % (
+                card_class,
+                badge_class,
+                rec.get("status", ""),
+                rec.get("customer_name", "بدون اسم"),
+                phone,
+                (rec.get("address") or last.get("address") or "—"),
+                (last.get("product_details") or "—"),
+                (last.get("section") or "—"),
+                (last.get("discount_code") or "—"),
+                order_count,
+                f"{_total_spent_of(rec):,.0f}",
+                f"{safe_float(last.get('price')):,.0f}",
+                f"{safe_float(last.get('shipping')):,.0f}",
+                f"{safe_float(last.get('total')):,.0f}",
+            ),
+            unsafe_allow_html=True,
+        )
 
         wa_num = to_whatsapp_number(phone)
-        msg = build_whatsapp_message(
-            {
-                "customer_name": rec.get("customer_name"),
-                "product_details": last.get("product_details"),
-                "section": last.get("section"),
-                "total": safe_float(last.get("total")),
-                "address": rec.get("address") or last.get("address"),
-            },
-            is_repeat,
-        )
-        wa_link = f"https://wa.me/{wa_num}?text={urllib.parse.quote(msg)}"
-        st.link_button(f"💬 مراسلة {rec.get('customer_name', phone)} على واتساب", wa_link)
+        if wa_num:
+            msg = build_whatsapp_message(
+                {
+                    "customer_name": rec.get("customer_name"),
+                    "product_details": last.get("product_details"),
+                    "section": last.get("section"),
+                    "total": safe_float(last.get("total")),
+                    "address": rec.get("address") or last.get("address"),
+                },
+                is_repeat,
+            )
+            wa_link = "https://wa.me/%s?text=%s" % (wa_num, urllib.parse.quote(msg))
+            st.link_button(
+                "💬 مراسلة %s على واتساب" % rec.get("customer_name", phone),
+                wa_link,
+                key="wa_%s_%d" % (phone, idx),
+            )
+        else:
+            st.warning("⚠️ رقم %s غير صالح للواتساب — تأكد من رقم الموبايل." % phone)
 
 # -------------------------------------------------
-# 10) Export + Danger zone
+# 11) Export + Danger zone
 # -------------------------------------------------
 if st.session_state.history:
     st.divider()
     st.subheader("⬇️ تصدير / إدارة")
-    df = pd.DataFrame(st.session_state.history)
-    st.dataframe(df, use_container_width=True)
-    csv = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ تحميل الأوردرات CSV", csv, "cap_vault_orders.csv", "text/csv")
+    try:
+        df = pd.DataFrame(st.session_state.history)
+        st.dataframe(df, use_container_width=True)
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ تحميل الأوردرات CSV", csv, "cap_vault_orders.csv", "text/csv")
+    except Exception as e:
+        st.error("❌ خطأ في عرض الجدول: " + str(e))
 
     if st.button("🗑️ مسح كل البيانات"):
         st.session_state.customers = {}
         st.session_state.history = []
         st.session_state.last_extract = None
+        st.session_state.last_model = ""
         st.rerun()
 
 st.divider()
-st.caption("Cap Vault AI 🧢 — Powered by Gemini 2.5 Flash | صُنع بحب في مصر 🇪🇬")
+st.caption("Cap Vault AI 🧢 v2 — Powered by %s | صُنع بحب في مصر 🇪🇬" % MODEL_CANDIDATES[0])
