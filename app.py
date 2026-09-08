@@ -1,4 +1,4 @@
-# Cap Vault AI v2 — Brand Caps Order Manager (Fixed)
+# PRIME BITES AI v2 — Order Manager (Fixed)
 # Supports NEW google-genai SDK + OLD google-generativeai fallback
 # Primary model: gemini-3.6-flash with automatic fallback chain
 # Key loaded securely from st.secrets["GEMINI_API_KEY"]
@@ -32,6 +32,9 @@ try:
 except Exception as e:
     OLD_SDK_ERROR = str(e)
 
+# Brand name (used in messages, header, footer)
+BRAND_NAME = "PRIME BITES"
+
 # Model fallback chain — first working model wins.
 # gemini-3.6-flash is the stable 2026 workhorse (July 2026 release).
 MODEL_CANDIDATES = [
@@ -46,8 +49,8 @@ MODEL_CANDIDATES = [
 # 1) Page Config (Mobile First)
 # -------------------------------------------------
 st.set_page_config(
-    page_title="Cap Vault AI 🧢",
-    page_icon="🧢",
+    page_title="PRIME BITES AI ⚡",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -178,7 +181,7 @@ def get_api_key():
 API_KEY = get_api_key()
 
 # -------------------------------------------------
-# 4) Helpers (all bugs fixed)
+# 4) Helpers
 # -------------------------------------------------
 def clean_egypt_phone(raw):
     """Normalize Egyptian phone to 01xxxxxxxxx. Returns '' if invalid."""
@@ -285,38 +288,75 @@ def normalize_section(section_raw, product_details=""):
         return "Stock"
     return "Classic"
 
-def build_whatsapp_message(data, is_repeat):
-    name = data.get("customer_name") or "عميلنا العزيز"
-    product = data.get("product_details") or "الأوردر الخاص بك"
-    section = data.get("section") or ""
-    total = data.get("total", 0)
+# -------------------------------------------------
+# WhatsApp message templates (user-editable)
+# Placeholders: {name} {product} {section} {price} {shipping}
+# {total} {address} {discount} {order_count} {total_spent} {brand}
+# -------------------------------------------------
+DEFAULT_WA_NEW = """أهلاً {name} 🌟 شكراً لطلبك من {brand} 🛍️
+
+تأكيد الأوردر:
+🛍️ المنتج: {product}
+📦 القسم: {section}
+📍 العنوان: {address}
+💰 الإجمالي: {total} جنيه
+
+هنأكد معاك الشحن قريباً 🚚
+{brand} — شكراً لثقتك ❤️"""
+
+DEFAULT_WA_REPEAT = """أهلاً {name} 🌟 منورنا مرة تانية في {brand} 🛍️
+
+تأكيد الأوردر:
+🛍️ المنتج: {product}
+📦 القسم: {section}
+📍 العنوان: {address}
+💰 الإجمالي: {total} جنيه
+
+ده طلبك رقم {order_count} معانا 🎉 وإجمالي تعاملك: {total_spent} جنيه
+هنأكد معاك الشحن قريباً 🚚
+{brand} — شكراً لثقتك ❤️"""
+
+WA_VARIABLES_HELP = "{name} الاسم | {product} المنتج | {section} القسم | {price} السعر | {shipping} الشحن | {total} الإجمالي | {address} العنوان | {discount} كود الخصم | {order_count} عدد الطلبات | {total_spent} إجمالي الإنفاق | {brand} اسم البراند"
+
+def _fmt_num(x):
     try:
-        total_str = f"{float(total):,.0f}"
+        return f"{float(x):,.0f}"
     except Exception:
-        total_str = str(total)
-    address = data.get("address") or ""
-    if is_repeat:
-        greeting = "أهلاً " + str(name) + " 🌟 منورنا مرة تانية في Cap Vault"
-    else:
-        greeting = "أهلاً " + str(name) + " 🌟 شكراً لطلبك من Cap Vault"
-    lines = [
-        greeting + " 🧢",
-        "",
-        "تأكيد الأوردر:",
-        "🧢 المنتج: " + str(product),
-        "📦 القسم: " + str(section),
-        "💰 الإجمالي: " + total_str + " جنيه",
-        "📍 العنوان: " + str(address),
-        "",
-        "هنأكد معاك الشحن قريباً 🚚",
-        "Cap Vault — شكراً لثقتك ❤️",
-    ]
-    return "\n".join(lines)
+        return str(x if x not in (None, "") else "—")
+
+def render_wa_template(template, rec, last):
+    """Fill template placeholders from customer record + last order."""
+    last = last or {}
+    values = {
+        "name": rec.get("customer_name") or "عميلنا العزيز",
+        "product": last.get("product_details") or "الأوردر الخاص بك",
+        "section": last.get("section") or "—",
+        "price": _fmt_num(last.get("price")),
+        "shipping": _fmt_num(last.get("shipping")),
+        "total": _fmt_num(last.get("total")),
+        "address": rec.get("address") or last.get("address") or "—",
+        "discount": last.get("discount_code") or "—",
+        "order_count": str(rec.get("order_count", 1)),
+        "total_spent": _fmt_num(rec.get("total_spent", 0)),
+        "brand": BRAND_NAME,
+    }
+    out = str(template or "")
+    for k, v in values.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+def build_whatsapp_message(data, is_repeat, rec=None):
+    """Backward-compatible wrapper using current templates."""
+    rec = rec or {}
+    tpl_new = st.session_state.get("wa_template_new", DEFAULT_WA_NEW)
+    tpl_repeat = st.session_state.get("wa_template_repeat", DEFAULT_WA_REPEAT)
+    tpl = tpl_repeat if is_repeat else tpl_new
+    return render_wa_template(tpl, rec, data)
 
 # -------------------------------------------------
 # 5) Gemini extraction (new SDK + old SDK + fallback)
 # -------------------------------------------------
-SYSTEM_PROMPT = """You are a data extraction assistant for an Egyptian caps brand called Cap Vault.
+SYSTEM_PROMPT = """You are a data extraction assistant for an Egyptian brand called PRIME BITES.
 Task: extract order data from any message (Egyptian Arabic, MSA, Franco-Arabic, or English — including online store order summaries).
 
 Return ONLY JSON with exactly these keys (no explanation):
@@ -325,7 +365,7 @@ Return ONLY JSON with exactly these keys (no explanation):
   "mobile": string or null (Egyptian mobile number),
   "address": string or null (full address: governorate - area - street - landmark),
   "section": string or null (exactly one of: Classic, Stock, Fitted — guess closest from product, default Classic),
-  "product_details": string or null (cap name + color + size + quantity in detail),
+  "product_details": string or null (product name + color + size + quantity in detail),
   "price": number or null (product subtotal without shipping),
   "shipping": number or null (shipping cost, 0 if not mentioned),
   "total": number or null (grand total = price + shipping, compute if missing),
@@ -334,7 +374,7 @@ Return ONLY JSON with exactly these keys (no explanation):
 
 Rules:
 - Numbers must be plain numbers without currency. "500 EGP" -> 500.
-- Store format like "Cap Name (red) x 1 EGP 500.00, Subtotal 500, Shipping 180, Total 680" -> price 500, shipping 180, total 680, product_details from the cap name line.
+- Store format like "Cap Name (red) x 1 EGP 500.00, Subtotal 500, Shipping 180, Total 680" -> price 500, shipping 180, total 680, product_details from the product name line.
 - "عايز 2 كلاسيك اسود" means quantity 2, section Classic.
 - Understand Franco like "ana 3ayez cap black".
 - Never invent a name, phone or address not present in the text — use null.
@@ -423,14 +463,18 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "order_text_input" not in st.session_state:
     st.session_state.order_text_input = ""
+if "wa_template_new" not in st.session_state:
+    st.session_state.wa_template_new = DEFAULT_WA_NEW
+if "wa_template_repeat" not in st.session_state:
+    st.session_state.wa_template_repeat = DEFAULT_WA_REPEAT
 
 # -------------------------------------------------
 # 7) Header
 # -------------------------------------------------
 st.markdown("""
 <div class="hero">
-    <h1>🧢 Cap Vault AI</h1>
-    <p>مدير أوردرات الكابات الذكي — استخراج تلقائي + عملاء + واتساب</p>
+    <h1>⚡ PRIME BITES AI</h1>
+    <p>مدير الأوردرات الذكي — استخراج تلقائي + عملاء + واتساب</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -480,7 +524,7 @@ st.divider()
 # -------------------------------------------------
 st.subheader("📝 أضف أوردر جديد")
 
-EXAMPLE_TEXT = "السلام عليكم، انا احمد محمد، رقمى 01012345678، العنوان: القاهرة - مدينة نصر - شارع عباس العقاد عمارة 5 الدور الثالث، عايز كاب Classic اسود مقاس L عدد 2، السعر 700 والشحن 50، ومعايا كود خصم CAP10"
+EXAMPLE_TEXT = "السلام عليكم، انا احمد محمد، رقمى 01012345678، العنوان: القاهرة - مدينة نصر - شارع عباس العقاد عمارة 5 الدور الثالث، عايز Classic اسود مقاس L عدد 2، السعر 700 والشحن 50، ومعايا كود خصم CAP10"
 
 order_text = st.text_area(
     "الصق رسالة العميل هنا (واتساب / فيسبوك / انستجرام / ملخص أوردر المتجر):",
@@ -608,7 +652,7 @@ if st.session_state.last_extract:
         st.write(f"📍 **العنوان:** {d.get('address') or '—'}")
         st.write(f"📦 **القسم:** {d.get('section') or '—'}")
     with c2:
-        st.write(f"🧢 **المنتج:** {d.get('product_details') or '—'}")
+        st.write(f"🛍️ **المنتج:** {d.get('product_details') or '—'}")
         st.write(f"💵 **السعر:** {safe_float(d.get('price')):,.0f} جنيه")
         st.write(f"🚚 **الشحن:** {safe_float(d.get('shipping')):,.0f} جنيه")
         st.write(f"💰 **الإجمالي:** {safe_float(d.get('total')):,.0f} جنيه")
@@ -616,6 +660,48 @@ if st.session_state.last_extract:
 
     with st.expander("🧾 عرض JSON الخام"):
         st.json(d)
+
+st.divider()
+
+# -------------------------------------------------
+# 9.5) WhatsApp message customization (user-editable)
+# -------------------------------------------------
+st.subheader("✏️ تخصيص رسالة الواتساب")
+st.caption("اكتب الرسالة بنفسك — المتغيرات المتاحة: " + WA_VARIABLES_HELP)
+
+tcol1, tcol2 = st.columns(2)
+with tcol1:
+    st.markdown("**🟢 رسالة العميل الجديد**")
+    st.text_area("قالب العميل الجديد:", height=220, key="wa_template_new")
+with tcol2:
+    st.markdown("**🔵 رسالة العميل المتكرر**")
+    st.text_area("قالب العميل المتكرر:", height=220, key="wa_template_repeat")
+
+bcol1, bcol2 = st.columns(2)
+with bcol1:
+    if st.button("↩️ استعادة الرسائل الافتراضية"):
+        st.session_state.wa_template_new = DEFAULT_WA_NEW
+        st.session_state.wa_template_repeat = DEFAULT_WA_REPEAT
+        for k in [k for k in st.session_state.keys() if str(k).startswith("wa_msg_")]:
+            del st.session_state[k]
+        st.rerun()
+with bcol2:
+    if st.button("🔄 تطبيق القالب على كل العملاء الحاليين"):
+        for k in [k for k in st.session_state.keys() if str(k).startswith("wa_msg_")]:
+            del st.session_state[k]
+        st.success("✅ هيتم استخدام القالب الجديد مع كل العملاء.")
+        st.rerun()
+
+with st.expander("👁️ معاينة الرسالة بمثال"):
+    demo_rec = {"customer_name": "أحمد محمد", "address": "القاهرة - مدينة نصر", "order_count": 3, "total_spent": 2150}
+    demo_last = {"product_details": "Classic أسود مقاس L × 2", "section": "Classic", "price": 700, "shipping": 50, "total": 750, "discount_code": "CAP10", "address": "القاهرة - مدينة نصر"}
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        st.markdown("**🟢 جديد:**")
+        st.text(render_wa_template(st.session_state.wa_template_new, demo_rec, demo_last))
+    with pcol2:
+        st.markdown("**🔵 متكرر:**")
+        st.text(render_wa_template(st.session_state.wa_template_repeat, demo_rec, demo_last))
 
 st.divider()
 
@@ -662,7 +748,7 @@ else:
             <span class="badge %s">%s</span>
             <h3>👤 %s — %s</h3>
             <div class="info-row">📍 <b>العنوان:</b> %s</div>
-            <div class="info-row">🧢 <b>آخر منتج:</b> %s</div>
+            <div class="info-row">🛍️ <b>آخر منتج:</b> %s</div>
             <div class="info-row">📦 <b>القسم:</b> %s &nbsp; | &nbsp; 🎟️ <b>خصم:</b> %s</div>
             <div class="info-row">🧾 <b>عدد الطلبات:</b> %s &nbsp; | &nbsp; 💰 <b>إجمالي الإنفاق:</b> %s جنيه</div>
             <div class="price-box">
@@ -691,17 +777,15 @@ else:
 
         wa_num = to_whatsapp_number(phone)
         if wa_num:
-            msg = build_whatsapp_message(
-                {
-                    "customer_name": rec.get("customer_name"),
-                    "product_details": last.get("product_details"),
-                    "section": last.get("section"),
-                    "total": safe_float(last.get("total")),
-                    "address": rec.get("address") or last.get("address"),
-                },
-                is_repeat,
-            )
-            wa_link = "https://wa.me/%s?text=%s" % (wa_num, urllib.parse.quote(msg))
+            tpl = st.session_state.get("wa_template_repeat", DEFAULT_WA_REPEAT) if is_repeat else st.session_state.get("wa_template_new", DEFAULT_WA_NEW)
+            default_msg = render_wa_template(tpl, rec, last)
+            msg_key = "wa_msg_%s" % phone
+            if msg_key not in st.session_state:
+                st.session_state[msg_key] = default_msg
+            with st.expander("✏️ تعديل رسالة %s قبل الإرسال" % rec.get("customer_name", phone)):
+                st.text_area("نص الرسالة:", height=180, key=msg_key)
+            final_msg = st.session_state.get(msg_key, default_msg) or default_msg
+            wa_link = "https://wa.me/%s?text=%s" % (wa_num, urllib.parse.quote(final_msg))
             st.link_button(
                 "💬 مراسلة %s على واتساب" % rec.get("customer_name", phone),
                 wa_link,
@@ -720,7 +804,7 @@ if st.session_state.history:
         df = pd.DataFrame(st.session_state.history)
         st.dataframe(df, use_container_width=True)
         csv = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ تحميل الأوردرات CSV", csv, "cap_vault_orders.csv", "text/csv")
+        st.download_button("⬇️ تحميل الأوردرات CSV", csv, "prime_bites_orders.csv", "text/csv")
     except Exception as e:
         st.error("❌ خطأ في عرض الجدول: " + str(e))
 
@@ -732,4 +816,4 @@ if st.session_state.history:
         st.rerun()
 
 st.divider()
-st.caption("Cap Vault AI 🧢 v2 — Powered by %s | صُنع بحب في مصر 🇪🇬" % MODEL_CANDIDATES[0])
+st.caption("PRIME BITES AI ⚡ — Powered by %s | صُنع بحب في مصر 🇪🇬" % MODEL_CANDIDATES[0])
