@@ -1,4 +1,5 @@
-# PRIME BITES AI v2 — Order Manager (Fixed)
+# PRIME BITES AI v4 — Order Manager + Internal Memory (SQLite)
+# Free internal memory: auto-save, no setup, no keys needed
 # Supports NEW google-genai SDK + OLD google-generativeai fallback
 # Primary model: gemini-3.6-flash with automatic fallback chain
 # Key loaded securely from st.secrets["GEMINI_API_KEY"]
@@ -6,6 +7,8 @@
 import streamlit as st
 import json
 import re
+import os
+import sqlite3
 import urllib.parse
 from datetime import datetime
 
@@ -187,6 +190,11 @@ def clean_egypt_phone(raw):
     """Normalize Egyptian phone to 01xxxxxxxxx. Returns '' if invalid."""
     if raw is None:
         return ""
+    if isinstance(raw, float):
+        if raw.is_integer():
+            raw = str(int(raw))
+        else:
+            raw = str(raw)
     digits = re.sub(r"\D", "", str(raw))
     if not digits:
         return ""
@@ -354,6 +362,138 @@ def build_whatsapp_message(data, is_repeat, rec=None):
     return render_wa_template(tpl, rec, data)
 
 # -------------------------------------------------
+# 4b) Internal memory (SQLite file — free, no setup)
+# -------------------------------------------------
+DB_PATH = os.path.join(os.getcwd(), "prime_bites.db")
+
+def db_connect():
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+def db_init():
+    con = db_connect()
+    con.execute("""CREATE TABLE IF NOT EXISTS customers (
+        phone TEXT PRIMARY KEY, customer_name TEXT, address TEXT,
+        order_count INTEGER DEFAULT 1, total_spent REAL DEFAULT 0,
+        status TEXT, first_seen TEXT, last_seen TEXT, last_order TEXT
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, mobile TEXT,
+        customer_name TEXT, address TEXT, section TEXT, product_details TEXT,
+        price REAL DEFAULT 0, shipping REAL DEFAULT 0, total REAL DEFAULT 0,
+        discount_code TEXT
+    )""")
+    con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    con.commit()
+    con.close()
+
+def db_load_all():
+    """Returns (customers_dict, history_list, settings_dict)."""
+    db_init()
+    con = db_connect()
+    customers = {}
+    for r in con.execute("SELECT * FROM customers"):
+        phone = clean_egypt_phone(r["phone"] or "")
+        if not phone:
+            continue
+        try:
+            last_order = json.loads(r["last_order"] or "{}")
+            if not isinstance(last_order, dict):
+                last_order = {}
+        except Exception:
+            last_order = {}
+        try:
+            oc = int(r["order_count"] or 1)
+        except Exception:
+            oc = 1
+        customers[phone] = {
+            "customer_name": r["customer_name"] or "بدون اسم",
+            "mobile": phone,
+            "address": r["address"] or "",
+            "order_count": oc,
+            "total_spent": safe_float(r["total_spent"], 0),
+            "status": r["status"] or ("متكرر 🔵" if oc > 1 else "جديد 🟢"),
+            "first_seen": r["first_seen"] or "",
+            "last_seen": r["last_seen"] or "",
+            "last_order": last_order,
+        }
+    history = []
+    for r in con.execute("SELECT * FROM orders ORDER BY id"):
+        history.append({
+            "time": r["time"] or "",
+            "mobile": clean_egypt_phone(r["mobile"] or ""),
+            "customer_name": r["customer_name"] or "",
+            "address": r["address"] or "",
+            "section": r["section"] or "Classic",
+            "product_details": r["product_details"] or "",
+            "price": safe_float(r["price"], 0),
+            "shipping": safe_float(r["shipping"], 0),
+            "total": safe_float(r["total"], 0),
+            "discount_code": r["discount_code"] or "",
+        })
+    settings = {}
+    for r in con.execute("SELECT key, value FROM settings"):
+        if r["key"]:
+            settings[r["key"]] = r["value"] or ""
+    con.close()
+    return customers, history, settings
+
+def db_upsert_customer(phone, rec):
+    con = db_connect()
+    con.execute(
+        """INSERT INTO customers (phone, customer_name, address, order_count, total_spent, status, first_seen, last_seen, last_order)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(phone) DO UPDATE SET customer_name=excluded.customer_name, address=excluded.address,
+        order_count=excluded.order_count, total_spent=excluded.total_spent, status=excluded.status,
+        first_seen=excluded.first_seen, last_seen=excluded.last_seen, last_order=excluded.last_order""",
+        (phone, rec.get("customer_name", ""), rec.get("address", ""), rec.get("order_count", 1),
+         rec.get("total_spent", 0), rec.get("status", ""), rec.get("first_seen", ""),
+         rec.get("last_seen", ""), json.dumps(rec.get("last_order", {}) or {}, ensure_ascii=False)),
+    )
+    con.commit()
+    con.close()
+
+def db_insert_order(order):
+    con = db_connect()
+    con.execute(
+        "INSERT INTO orders (time, mobile, customer_name, address, section, product_details, price, shipping, total, discount_code) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (order.get("time", ""), order.get("mobile", ""), order.get("customer_name", ""),
+         order.get("address", ""), order.get("section", ""), order.get("product_details", ""),
+         order.get("price", 0), order.get("shipping", 0), order.get("total", 0), order.get("discount_code", "")),
+    )
+    con.commit()
+    con.close()
+
+def db_save_setting(key, value):
+    con = db_connect()
+    con.execute(
+        "INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    con.commit()
+    con.close()
+
+def db_get_setting(key, default=""):
+    try:
+        con = db_connect()
+        r = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        con.close()
+        if r and r["value"]:
+            return r["value"]
+    except Exception:
+        pass
+    return default
+
+def db_clear_all():
+    con = db_connect()
+    con.execute("DELETE FROM customers")
+    con.execute("DELETE FROM orders")
+    con.execute("DELETE FROM settings")
+    con.commit()
+    con.close()
+
+# -------------------------------------------------
 # 5) Gemini extraction (new SDK + old SDK + fallback)
 # -------------------------------------------------
 SYSTEM_PROMPT = """You are a data extraction assistant for an Egyptian brand called PRIME BITES.
@@ -451,7 +591,7 @@ def extract_order(order_text, api_key):
     raise RuntimeError("All models failed. Details: " + detail)
 
 # -------------------------------------------------
-# 6) Session State (Customers DB)
+# 6) Session State + internal memory auto-load
 # -------------------------------------------------
 if "customers" not in st.session_state:
     st.session_state.customers = {}
@@ -467,6 +607,29 @@ if "wa_template_new" not in st.session_state:
     st.session_state.wa_template_new = DEFAULT_WA_NEW
 if "wa_template_repeat" not in st.session_state:
     st.session_state.wa_template_repeat = DEFAULT_WA_REPEAT
+if "db_ok" not in st.session_state:
+    st.session_state.db_ok = False
+if "db_error" not in st.session_state:
+    st.session_state.db_error = ""
+if "db_loaded" not in st.session_state:
+    st.session_state.db_loaded = False
+
+# Auto-load from internal memory once per session
+if not st.session_state.db_loaded:
+    st.session_state.db_loaded = True
+    try:
+        _c, _h, _s = db_load_all()
+        st.session_state.customers = _c
+        st.session_state.history = _h
+        if _s.get("wa_template_new"):
+            st.session_state.wa_template_new = _s["wa_template_new"]
+        if _s.get("wa_template_repeat"):
+            st.session_state.wa_template_repeat = _s["wa_template_repeat"]
+        st.session_state.db_ok = True
+        st.session_state.db_error = ""
+    except Exception as e:
+        st.session_state.db_ok = False
+        st.session_state.db_error = str(e)[:200]
 
 # -------------------------------------------------
 # 7) Header
@@ -488,6 +651,12 @@ else:
     if HAS_OLD_SDK:
         sdk_info.append("generativeai ✅")
     st.success("✅ الاتصال بـ Gemini جاهز (%s) — الموديل الأساسي: %s" % (" + ".join(sdk_info) if sdk_info else "لا يوجد SDK!", MODEL_CANDIDATES[0]))
+
+# Internal memory status
+if st.session_state.db_ok:
+    st.success("💾 الذاكرة الداخلية شغالة ✅ — %d عميل / %d أوردر محفوظين تلقائياً" % (len(st.session_state.customers), len(st.session_state.history)))
+else:
+    st.warning("⚠️ الذاكرة الداخلية فيها مشكلة — شغال مؤقتاً. (%s)" % (st.session_state.db_error or "؟"))
 
 # Metrics row (crash-safe)
 def _total_spent_of(rec):
@@ -600,7 +769,7 @@ if btn_extract:
                             "last_order": data,
                         }
                         is_repeat = False
-                    st.session_state.history.append({
+                    new_order_row = {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "mobile": phone,
                         "customer_name": data.get("customer_name"),
@@ -611,7 +780,18 @@ if btn_extract:
                         "shipping": data.get("shipping"),
                         "total": data.get("total"),
                         "discount_code": data.get("discount_code"),
-                    })
+                    }
+                    st.session_state.history.append(new_order_row)
+
+                    # ---- Auto-save to internal memory ----
+                    if st.session_state.db_ok:
+                        try:
+                            db_insert_order(new_order_row)
+                            db_upsert_customer(phone, st.session_state.customers[phone])
+                            st.caption("💾 اتحفظ في الذاكرة ✅")
+                        except Exception as de:
+                            st.warning("⚠️ اتسجل مؤقتاً لكن الحفظ فشل: %s" % str(de)[:150])
+
                     if is_repeat:
                         rec = st.session_state.customers[phone]
                         st.info("🔵 عميل متكرر! %s — عدد الطلبات: %s — إجمالي الإنفاق: %,.0f جنيه" % (rec.get("customer_name"), rec.get("order_count"), _total_spent_of(rec)))
@@ -667,7 +847,7 @@ st.divider()
 # 9.5) WhatsApp message customization (user-editable)
 # -------------------------------------------------
 st.subheader("✏️ تخصيص رسالة الواتساب")
-st.caption("اكتب الرسالة بنفسك — المتغيرات المتاحة: " + WA_VARIABLES_HELP)
+st.caption("اكتب الرسالة بنفسك — بتتحفظ في الذاكرة تلقائياً ✅ — المتغيرات: " + WA_VARIABLES_HELP)
 
 tcol1, tcol2 = st.columns(2)
 with tcol1:
@@ -677,11 +857,27 @@ with tcol2:
     st.markdown("**🔵 رسالة العميل المتكرر**")
     st.text_area("قالب العميل المتكرر:", height=220, key="wa_template_repeat")
 
+# Auto-save templates to internal memory (silent)
+if st.session_state.db_ok:
+    try:
+        if st.session_state.wa_template_new != db_get_setting("wa_template_new", DEFAULT_WA_NEW):
+            db_save_setting("wa_template_new", st.session_state.wa_template_new)
+        if st.session_state.wa_template_repeat != db_get_setting("wa_template_repeat", DEFAULT_WA_REPEAT):
+            db_save_setting("wa_template_repeat", st.session_state.wa_template_repeat)
+    except Exception:
+        pass
+
 bcol1, bcol2 = st.columns(2)
 with bcol1:
     if st.button("↩️ استعادة الرسائل الافتراضية"):
         st.session_state.wa_template_new = DEFAULT_WA_NEW
         st.session_state.wa_template_repeat = DEFAULT_WA_REPEAT
+        if st.session_state.db_ok:
+            try:
+                db_save_setting("wa_template_new", DEFAULT_WA_NEW)
+                db_save_setting("wa_template_repeat", DEFAULT_WA_REPEAT)
+            except Exception:
+                pass
         for k in [k for k in st.session_state.keys() if str(k).startswith("wa_msg_")]:
             del st.session_state[k]
         st.rerun()
@@ -809,11 +1005,18 @@ if st.session_state.history:
         st.error("❌ خطأ في عرض الجدول: " + str(e))
 
     if st.button("🗑️ مسح كل البيانات"):
+        if st.session_state.db_ok:
+            try:
+                db_clear_all()
+            except Exception:
+                pass
         st.session_state.customers = {}
         st.session_state.history = []
         st.session_state.last_extract = None
         st.session_state.last_model = ""
+        for k in [k for k in st.session_state.keys() if str(k).startswith("wa_msg_")]:
+            del st.session_state[k]
         st.rerun()
 
 st.divider()
-st.caption("PRIME BITES AI ⚡ — Powered by %s | صُنع بحب في مصر 🇪🇬" % MODEL_CANDIDATES[0])
+st.caption("PRIME BITES AI ⚡ v4 — Powered by %s | صُنع بحب في مصر 🇪🇬" % MODEL_CANDIDATES[0])
